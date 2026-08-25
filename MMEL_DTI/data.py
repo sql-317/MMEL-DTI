@@ -28,13 +28,18 @@ class DTIDataset(Dataset):
     def __getitem__(self, index):
         row = self.frame.iloc[index]
         protein_id = str(row.protein_idx)
-        if protein_id not in self.esm or protein_id not in self.structure:
-            raise KeyError(f"Missing precomputed protein embedding: {protein_id}")
+        if protein_id not in self.esm:
+            raise KeyError(f"Missing ESM embedding: {protein_id}")
+        structure = self.structure.get(protein_id)
+        structure_available = structure is not None
+        if structure is None:
+            structure = torch.zeros_like(next(iter(self.structure.values())))
         return {
             "graph": molecule_to_graph(row.SMILES),
             "sequence": str(row["Target Sequence"]),
             "esm_embedding": self.esm[protein_id],
-            "structure_embedding": self.structure[protein_id],
+            "structure_embedding": structure,
+            "structure_available": torch.tensor(structure_available, dtype=torch.bool),
             "label": torch.tensor(float(row.Label), dtype=torch.float32),
         }
 
@@ -43,6 +48,6 @@ def collate(items):
     return (
         Batch.from_data_list([x["graph"] for x in items]),
         {key: ([x[key] for x in items] if key == "sequence" else torch.stack([x[key] for x in items]))
-         for key in ("sequence", "esm_embedding", "structure_embedding")},
+         for key in ("sequence", "esm_embedding", "structure_embedding", "structure_available")},
         torch.stack([x["label"] for x in items]),
     )

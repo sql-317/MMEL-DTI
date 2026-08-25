@@ -120,6 +120,9 @@ class ProteinEncoder(nn.Module):
     def forward(self, data):
         esm = self.esm(data["esm_embedding"])
         structure = self.structure(data["structure_embedding"])
+        available = data.get("structure_available")
+        if available is not None:
+            structure = structure * available.to(structure.device).bool().unsqueeze(-1).to(structure.dtype)
         ids, mask = self._indices(data["sequence"], esm.device)
         x = self.aa(ids)
         x = self.seq_mamba(x, mask).transpose(1, 2)

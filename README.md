@@ -1,4 +1,4 @@
-# MMEL-DTI main model
+# MMEL-DTI
 
 This directory contains a compact release of the MMEL-DTI main configuration.
 It uses a GAT drug encoder, chemically informed atom ordering, native

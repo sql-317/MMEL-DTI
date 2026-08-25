@@ -25,11 +25,10 @@ class DrugEncoder(nn.Module):
         self.rule_coefficients = nn.Parameter(torch.tensor([1., 2., 1.5, .5, 1., .8]))
         self.rule_scale = nn.Parameter(torch.tensor(0.0))
         self.mamba = BidirectionalMamba(cfg.mamba_dim, cfg.mamba_state, cfg.mamba_conv,
-                                        cfg.mamba_expand, cfg.mamba_headdim, cfg.mamba_chunk)
-        self.pool_score = nn.Sequential(nn.Linear(cfg.mamba_dim, cfg.mamba_dim // 2), nn.GELU(),
-                                        nn.Linear(cfg.mamba_dim // 2, 1))
-        self.output = nn.Sequential(nn.Linear(cfg.mamba_dim, cfg.drug_dim),
-                                    nn.LayerNorm(cfg.drug_dim), nn.GELU(), nn.Dropout(cfg.dropout))
+                                        cfg.mamba_expand, cfg.mamba_scan_expand,
+                                        cfg.mamba_headdim, cfg.mamba_chunk, residual_scale=0.1)
+        self.output_proj = nn.Sequential(nn.Linear(cfg.mamba_dim, cfg.drug_dim),
+                                         nn.LayerNorm(cfg.drug_dim), nn.Dropout(cfg.dropout))
 
     def forward(self, batch_graph):
         x = F.elu(self.gat(batch_graph.x, batch_graph.edge_index, batch_graph.edge_attr))
@@ -55,17 +54,30 @@ class DrugEncoder(nn.Module):
             else:
                 chemical = torch.zeros_like(contextual)
             scores = contextual + F.softplus(self.rule_scale) * chemical
+            local = local * (1.0 + scores.sigmoid().unsqueeze(-1))
             order = scores.argsort(descending=True)
             padded[i, :len(local)] = local[order]
             mask[i, :len(local)] = True
             orders.append(order)
         z = self.to_mamba(padded)
+        z = z * mask.unsqueeze(-1).to(z.dtype)
         z = self.mamba(z, mask)
-        logits = self.pool_score(z).squeeze(-1).masked_fill(~mask, torch.finfo(z.dtype).min)
-        weights = logits.softmax(1)
+        z = self.output_proj(z)
+        # The released main configuration uses the learned chemical-rule
+        # pooling path after Mamba.
+        pooled_logits = z.new_zeros(len(lengths), max_len)
+        for i, (start, end) in enumerate(zip(ptr[:-1], ptr[1:])):
+            local_smiles = str(smiles[i]) if i < len(smiles) else ""
+            from rdkit import Chem
+            mol = Chem.MolFromSmiles(local_smiles)
+            if mol is not None and mol.GetNumAtoms() == lengths[i]:
+                values = chemical_rule_features(mol).to(device) @ self.rule_coefficients
+                pooled_logits[i, :lengths[i]] = values[orders[i]]
+        pooled_logits = pooled_logits.masked_fill(~mask, torch.finfo(z.dtype).min)
+        weights = pooled_logits.softmax(1)
         self.last_atom_weights = weights.detach()
         self.last_node_orders = orders
-        return self.output((z * weights.unsqueeze(-1)).sum(1))
+        return self.output_proj((z * weights.unsqueeze(-1)).sum(1))
 
 
 class ProteinEncoder(nn.Module):
@@ -80,16 +92,20 @@ class ProteinEncoder(nn.Module):
                                        nn.LayerNorm(cfg.structure_branch_dim), nn.GELU(), nn.Dropout(cfg.dropout))
         self.aa = nn.Embedding(26, cfg.aa_dim, padding_idx=0)
         self.seq_mamba = BidirectionalMamba(cfg.aa_dim, cfg.mamba_state, cfg.mamba_conv,
-                                            cfg.mamba_expand, cfg.mamba_headdim, cfg.mamba_chunk)
+                                            cfg.mamba_expand, 2,
+                                            cfg.mamba_headdim, cfg.mamba_chunk, residual_scale=0.0)
         splits = [cfg.sequence_dim // 3 + cfg.sequence_dim % 3] + [cfg.sequence_dim // 3] * 2
         self.convs = nn.ModuleList([nn.Conv1d(cfg.aa_dim, c, k, padding=k // 2)
                                     for c, k in zip(splits, (3, 5, 7))])
         self.norms = nn.ModuleList([nn.BatchNorm1d(c) for c in splits])
         self.seq_attention = nn.Linear(cfg.sequence_dim, 1)
+        self.seq_post = nn.Sequential(nn.Linear(cfg.sequence_dim, cfg.sequence_dim),
+                                      nn.LayerNorm(cfg.sequence_dim), nn.GELU(), nn.Dropout(cfg.dropout))
         self.seq_project = nn.Sequential(nn.Linear(cfg.sequence_dim, cfg.esm_branch_dim),
                                           nn.LayerNorm(cfg.esm_branch_dim), nn.GELU(), nn.Dropout(cfg.dropout))
         self.gate = nn.Sequential(nn.Linear(cfg.esm_branch_dim * 3, 128), nn.GELU(),
                                   nn.Dropout(cfg.dropout), nn.Linear(128, 2))
+        self.gate_scale = nn.Parameter(torch.tensor(-2.1972))
         self.output = nn.Sequential(nn.Linear(cfg.esm_branch_dim, cfg.protein_dim),
                                     nn.LayerNorm(cfg.protein_dim), nn.GELU(), nn.Dropout(cfg.dropout))
 
@@ -111,9 +127,11 @@ class ProteinEncoder(nn.Module):
         x = torch.cat(conv, 1).transpose(1, 2)
         a = self.seq_attention(x).squeeze(-1).masked_fill(~mask, torch.finfo(x.dtype).min).softmax(1)
         self.last_residue_attention = a.detach().unsqueeze(-1)
-        sequence = self.seq_project((x * a.unsqueeze(-1)).sum(1))
+        sequence = self.seq_post((x * a.unsqueeze(-1)).sum(1))
+        sequence = self.seq_project(sequence)
         gates = self.gate(torch.cat([esm, structure, sequence], -1)).sigmoid()
-        fused = esm + self.cfg.structure_residual_weight * gates[:, :1] * structure + gates[:, 1:2] * sequence
+        shared = torch.sigmoid(self.gate_scale)
+        fused = esm + self.cfg.structure_residual_weight * gates[:, :1] * structure + shared * gates[:, 1:2] * sequence
         return self.output(fused)
 
 

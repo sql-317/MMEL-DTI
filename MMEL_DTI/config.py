@@ -20,6 +20,7 @@ class ModelConfig:
     mamba_state: int = 16
     mamba_conv: int = 4
     mamba_expand: int = 2
+    mamba_scan_expand: int = 1
     mamba_headdim: int = 64
     mamba_chunk: int = 64
 

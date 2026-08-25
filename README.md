@@ -1,9 +1,9 @@
 # MMEL-DTI
 
-This repository provides the compact implementation of MMEL-DTI described in
-the accompanying paper. MMEL-DTI integrates graph attention, chemically
-informed atom ordering, native bidirectional Mamba-2, protein sequence and
-pretrained representations, structural features, and ISF-based prediction.
+This repository provides the implementation of MMEL-DTI described in the
+accompanying paper. MMEL-DTI integrates graph attention, chemically informed
+atom ordering, bidirectional Mamba-2, protein sequence and pretrained
+representations, structural features, and ISF-based prediction.
 
 ## Requirements
 

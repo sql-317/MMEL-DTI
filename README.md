@@ -16,7 +16,7 @@ The native Mamba-2 implementation requires a CUDA-enabled environment.
 ## Training
 
 ```bash
-python -m mmdlti.train \
+python -m MMEL_DTI.train \
   --csv DATA.csv \
   --esm-embeddings ESM_EMBEDDINGS.pt \
   --structure-embeddings STRUCTURE_EMBEDDINGS.pt \

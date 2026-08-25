@@ -62,7 +62,6 @@ class DrugEncoder(nn.Module):
         z = self.to_mamba(padded)
         z = z * mask.unsqueeze(-1).to(z.dtype)
         z = self.mamba(z, mask)
-        z = self.output_proj(z)
         # The released main configuration uses the learned chemical-rule
         # pooling path after Mamba.
         pooled_logits = z.new_zeros(len(lengths), max_len)

@@ -1,8 +1,9 @@
-"""Compact MMEL-DTI main model: GAT, bidirectional Mamba-2, protein branches and ISF."""
+"""MMEL-DTI main model: GAT, bidirectional Mamba-2, protein branches and ISF."""
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
+from rdkit import Chem
 
 from .config import ModelConfig
 from .graph import chemical_rule_features
@@ -15,11 +16,18 @@ class DrugEncoder(nn.Module):
         self.cfg = cfg
         self.gat = GATConv(cfg.atom_feature_dim, cfg.gat_hidden,
                            heads=cfg.gat_heads, concat=True, edge_dim=cfg.bond_feature_dim,
-                           dropout=cfg.dropout)
+                           dropout=cfg.dropout, add_self_loops=True, fill_value=0.0)
+        for name, parameter in self.gat.named_parameters():
+            if "weight" in name:
+                nn.init.xavier_uniform_(parameter, gain=0.5)
+            elif "bias" in name and parameter is not None:
+                nn.init.zeros_(parameter)
         gat_dim = cfg.gat_hidden * cfg.gat_heads
+        self.gat_norm = nn.BatchNorm1d(gat_dim)
         self.reduce = nn.Sequential(nn.Linear(gat_dim, cfg.drug_dim), nn.LayerNorm(cfg.drug_dim),
                                     nn.GELU(), nn.Dropout(cfg.dropout))
-        self.to_mamba = nn.Sequential(nn.Linear(cfg.drug_dim, cfg.mamba_dim), nn.LayerNorm(cfg.mamba_dim))
+        self.to_mamba = nn.Sequential(nn.Linear(cfg.drug_dim, cfg.mamba_dim),
+                                      nn.LayerNorm(cfg.mamba_dim), nn.Dropout(cfg.dropout))
         self.rank = nn.Sequential(nn.Linear(cfg.drug_dim, cfg.drug_dim // 2), nn.GELU(),
                                   nn.Linear(cfg.drug_dim // 2, 1))
         self.rule_coefficients = nn.Parameter(torch.tensor([1., 2., 1.5, .5, 1., .8]))
@@ -29,9 +37,26 @@ class DrugEncoder(nn.Module):
                                         cfg.mamba_headdim, cfg.mamba_chunk, residual_scale=0.1)
         self.output_proj = nn.Sequential(nn.Linear(cfg.mamba_dim, cfg.drug_dim),
                                          nn.LayerNorm(cfg.drug_dim), nn.Dropout(cfg.dropout))
+        self.output_norm = nn.BatchNorm1d(cfg.drug_dim)
+        self._molecule_cache = {}
+        self._rule_cache = {}
+
+    def _rules(self, smiles, node_count, device):
+        smiles = str(smiles)
+        if smiles not in self._molecule_cache:
+            self._molecule_cache[smiles] = Chem.MolFromSmiles(smiles)
+        mol = self._molecule_cache[smiles]
+        if mol is None or mol.GetNumAtoms() != node_count:
+            return None
+        if smiles not in self._rule_cache:
+            self._rule_cache[smiles] = chemical_rule_features(mol)
+        return self._rule_cache[smiles].to(device)
 
     def forward(self, batch_graph):
         x = F.elu(self.gat(batch_graph.x, batch_graph.edge_index, batch_graph.edge_attr))
+        x = F.dropout(x, self.cfg.dropout, self.training)
+        if x.shape[0] > 1:
+            x = self.gat_norm(x)
         x = self.reduce(x)
         ptr = batch_graph.ptr
         smiles = batch_graph.smiles if isinstance(batch_graph.smiles, list) else [batch_graph.smiles]
@@ -43,13 +68,9 @@ class DrugEncoder(nn.Module):
         orders = []
         for i, (start, end) in enumerate(zip(ptr[:-1], ptr[1:])):
             local = x[start:end]
-            mol = None
-            if i < len(smiles):
-                from rdkit import Chem
-                mol = Chem.MolFromSmiles(str(smiles[i]))
             contextual = self.rank(local).squeeze(-1)
-            if mol is not None and mol.GetNumAtoms() == len(local):
-                rules = chemical_rule_features(mol).to(device)
+            rules = self._rules(smiles[i], len(local), device) if i < len(smiles) else None
+            if rules is not None:
                 chemical = rules @ self.rule_coefficients
             else:
                 chemical = torch.zeros_like(contextual)
@@ -66,21 +87,20 @@ class DrugEncoder(nn.Module):
         # pooling path after Mamba.
         pooled_logits = z.new_zeros(len(lengths), max_len)
         for i, (start, end) in enumerate(zip(ptr[:-1], ptr[1:])):
-            local_smiles = str(smiles[i]) if i < len(smiles) else ""
-            from rdkit import Chem
-            mol = Chem.MolFromSmiles(local_smiles)
-            if mol is not None and mol.GetNumAtoms() == lengths[i]:
-                values = chemical_rule_features(mol).to(device) @ self.rule_coefficients
+            rules = self._rules(smiles[i], lengths[i], device) if i < len(smiles) else None
+            if rules is not None:
+                values = rules @ self.rule_coefficients
                 pooled_logits[i, :lengths[i]] = values[orders[i]]
         pooled_logits = pooled_logits.masked_fill(~mask, torch.finfo(z.dtype).min)
         weights = pooled_logits.softmax(1)
         self.last_atom_weights = weights.detach()
         self.last_node_orders = orders
-        return self.output_proj((z * weights.unsqueeze(-1)).sum(1))
+        output = self.output_proj((z * weights.unsqueeze(-1)).sum(1))
+        return self.output_norm(output) if output.shape[0] > 1 else output
 
 
 class ProteinEncoder(nn.Module):
-    AA = {a: i + 1 for i, a in enumerate("ACDEFGHIKLMNPQRSTVWY")}
+    AA = {a: i + 1 for i, a in enumerate("ACDEFGHIKLMNPQRSTVWYUOBZX")}
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -102,11 +122,12 @@ class ProteinEncoder(nn.Module):
                                       nn.LayerNorm(cfg.sequence_dim), nn.GELU(), nn.Dropout(cfg.dropout))
         self.seq_project = nn.Sequential(nn.Linear(cfg.sequence_dim, cfg.esm_branch_dim),
                                           nn.LayerNorm(cfg.esm_branch_dim), nn.GELU(), nn.Dropout(cfg.dropout))
-        self.gate = nn.Sequential(nn.Linear(cfg.esm_branch_dim * 3, 128), nn.GELU(),
+        self.gate = nn.Sequential(nn.Linear(cfg.esm_branch_dim * 3, 128), nn.LayerNorm(128), nn.GELU(),
                                   nn.Dropout(cfg.dropout), nn.Linear(128, 2))
         self.gate_scale = nn.Parameter(torch.tensor(-2.1972))
         self.output = nn.Sequential(nn.Linear(cfg.esm_branch_dim, cfg.protein_dim),
                                     nn.LayerNorm(cfg.protein_dim), nn.GELU(), nn.Dropout(cfg.dropout))
+        self.output_norm = nn.BatchNorm1d(cfg.protein_dim)
 
     def _indices(self, sequences, device):
         length = max(map(len, sequences))
@@ -134,7 +155,7 @@ class ProteinEncoder(nn.Module):
         gates = self.gate(torch.cat([esm, structure, sequence], -1)).sigmoid()
         shared = torch.sigmoid(self.gate_scale)
         fused = esm + self.cfg.structure_residual_weight * gates[:, :1] * structure + shared * gates[:, 1:2] * sequence
-        return self.output(fused)
+        return self.output_norm(self.output(fused))
 
 
 class ISFHead(nn.Module):
@@ -166,6 +187,22 @@ class MMELDTI(nn.Module):
         self.drug_encoder = DrugEncoder(self.cfg)
         self.protein_encoder = ProteinEncoder(self.cfg)
         self.head = ISFHead(self.cfg)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.01)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.BatchNorm1d):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
 
     def forward(self, graph, protein_data):
         return self.head(self.drug_encoder(graph), self.protein_encoder(protein_data))

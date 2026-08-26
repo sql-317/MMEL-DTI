@@ -30,13 +30,10 @@ class ModelConfig:
     esm_branch_dim: int = 384
     structure_branch_dim: int = 384
     protein_dim: int = 512
+    max_protein_length: int = 1024
 
     dropout: float = 0.2
     structure_residual_weight: float = 0.05
-
-    # The main model always uses all three protein branches and ISF fusion.
-    use_esm: bool = True
-    use_structure: bool = True
 
     def validate(self) -> None:
         if self.gat_hidden * self.gat_heads <= 0:

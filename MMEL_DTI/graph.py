@@ -64,6 +64,10 @@ def structural_encoding(edge_index, n, pe_dim=8, walk_dim=8):
     take = min(pe_dim, max(n - 1, 0))
     if take:
         pe[:, :take] = vec[:, 1:take + 1]
+    for column in range(pe_dim):
+        nonzero = torch.nonzero(pe[:, column].abs() > 1e-6, as_tuple=True)[0]
+        if len(nonzero) and pe[nonzero[0], column] < 0:
+            pe[:, column] = -pe[:, column]
     transition = adj / degree.clamp_min(1).unsqueeze(1)
     current = torch.eye(n)
     walks = []

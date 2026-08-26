@@ -3,3 +3,5 @@ torch-geometric>=2.5
 rdkit
 mamba-ssm>=2.2
 pandas
+numpy
+scikit-learn

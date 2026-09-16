@@ -5,6 +5,11 @@ accompanying paper. MMEL-DTI integrates graph attention, chemically informed
 atom ordering, bidirectional Mamba, protein sequence and pretrained
 representations, structural features, and ISF-based prediction.
 
+In the released main model, the drug representation is projected into the
+protein feature space and incorporated through an element-wise ISF gate. The
+prediction MLP consumes only the resulting pair-dependent ISF representation;
+the original drug vector is not concatenated again after fusion.
+
 ## Requirements
 
 ```bash

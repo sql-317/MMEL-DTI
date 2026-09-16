@@ -35,6 +35,9 @@ class ModelConfig:
     dropout: float = 0.2
     structure_residual_weight: float = 0.05
 
+    # The prediction head consumes only the pair-dependent ISF representation;
+    # the original drug vector is not concatenated after fusion.
+
     def validate(self) -> None:
         if self.gat_hidden * self.gat_heads <= 0:
             raise ValueError("GAT dimensions must be positive")

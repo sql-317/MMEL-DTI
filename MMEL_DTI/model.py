@@ -159,12 +159,14 @@ class ProteinEncoder(nn.Module):
 
 
 class ISFHead(nn.Module):
+    """Pair-dependent ISF head without a raw-drug concatenation shortcut."""
+
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.drug_projection = nn.Linear(cfg.drug_dim, cfg.protein_dim)
         self.attention = nn.Sequential(nn.Linear(cfg.protein_dim, cfg.protein_dim // 4), nn.ReLU(),
                                        nn.Linear(cfg.protein_dim // 4, cfg.protein_dim), nn.Sigmoid())
-        dims = [cfg.drug_dim + cfg.protein_dim, 512, 256, 128, 1]
+        dims = [cfg.protein_dim, 512, 256, 128, 1]
         layers = []
         for a, b in zip(dims[:-1], dims[1:]):
             layers += [nn.LayerNorm(a), nn.Linear(a, b)]
@@ -175,8 +177,8 @@ class ISFHead(nn.Module):
     def forward(self, drug, protein):
         d = self.drug_projection(drug)
         gate = self.attention(protein + d)
-        p = protein * gate + d * (1 - gate)
-        return self.predictor(torch.cat([drug, p], -1)).squeeze(-1).clamp(-10, 10)
+        fused = protein * gate + d * (1 - gate)
+        return self.predictor(fused).squeeze(-1).clamp(-10, 10)
 
 
 class MMELDTI(nn.Module):
